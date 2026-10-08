@@ -286,6 +286,47 @@ function parse_product_colors($value)
     return $colors;
 }
 
+/* ===== Wishlist Items Helper ===== */
+function get_customer_wishlist_items($conn, $customerId)
+{
+    $items = [];
+    $customerId = (int) $customerId;
+
+    if ($customerId <= 0) {
+        return $items;
+    }
+
+    $stmt = $conn->prepare("
+        SELECT
+            p.id,
+            p.name,
+            p.price,
+            p.offer_price,
+            p.image_url,
+            p.stock_quantity
+        FROM wishlists w
+        INNER JOIN products p ON p.id = w.product_id
+        WHERE w.customer_id = ?
+        ORDER BY w.id DESC
+    ");
+
+    if (!$stmt) {
+        return $items;
+    }
+
+    $stmt->bind_param("i", $customerId);
+    $stmt->execute();
+    $result = $stmt->get_result();
+
+    while ($row = $result->fetch_assoc()) {
+        $items[] = $row;
+    }
+
+    $stmt->close();
+    return $items;
+}
+
+
 /* ===== Site settings ===== */
 $settings = $conn->query("SELECT * FROM site_settings LIMIT 1")->fetch_assoc();
 if (!$settings) {
@@ -308,43 +349,85 @@ $sort = $_GET['sort'] ?? 'new';
 
 /* ===== Wishlist Add / Remove ===== */
 $wishlistNotice = '';
+
 if (isset($_POST['wishlist_action'])) {
     $wishlistProductId = (int) ($_POST['wishlist_product_id'] ?? 0);
     $wishlistAction = (string) ($_POST['wishlist_action'] ?? '');
+    $wishlistAjax = (
+        (string) ($_POST['wishlist_ajax'] ?? '') === '1' ||
+        strtolower((string) ($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest'
+    );
+
+    $wishlistSuccess = false;
+    $wishlistSaved = false;
+    $wishlistMessage = 'Unable to update wishlist.';
 
     if ($wishlistProductId > 0 && $currentCustomerId > 0) {
         if ($wishlistAction === 'add') {
             $wishStmt = $conn->prepare("INSERT IGNORE INTO wishlists(customer_id, product_id) VALUES(?, ?)");
+
             if ($wishStmt) {
                 $wishStmt->bind_param("ii", $currentCustomerId, $wishlistProductId);
-                $wishStmt->execute();
+
+                if ($wishStmt->execute()) {
+                    $wishlistSuccess = true;
+                    $wishlistSaved = true;
+                    $wishlistMessage = 'Laptop saved to your wishlist.';
+                    $wishlistNotice = '❤️ Laptop saved to your wishlist.';
+                }
+
                 $wishStmt->close();
-                $wishlistNotice = '❤️ Laptop added to your wishlist. You will receive an email if its offer price drops.';
             }
         } elseif ($wishlistAction === 'remove') {
             $wishStmt = $conn->prepare("DELETE FROM wishlists WHERE customer_id=? AND product_id=?");
+
             if ($wishStmt) {
                 $wishStmt->bind_param("ii", $currentCustomerId, $wishlistProductId);
-                $wishStmt->execute();
+
+                if ($wishStmt->execute()) {
+                    $wishlistSuccess = true;
+                    $wishlistSaved = false;
+                    $wishlistMessage = 'Wishlist item removed.';
+                    $wishlistNotice = 'Wishlist item removed.';
+                }
+
                 $wishStmt->close();
-                $wishlistNotice = 'Wishlist item removed.';
             }
+        } else {
+            $wishlistMessage = 'Invalid wishlist action.';
         }
+    } else {
+        $wishlistMessage = 'Invalid wishlist request.';
+    }
+
+    if ($wishlistAjax) {
+        $ajaxWishlistItems = get_customer_wishlist_items($conn, $currentCustomerId);
+
+        http_response_code($wishlistSuccess ? 200 : 400);
+        header('Content-Type: application/json; charset=UTF-8');
+
+        echo json_encode(
+            [
+                'success' => $wishlistSuccess,
+                'saved' => $wishlistSaved,
+                'product_id' => $wishlistProductId,
+                'count' => count($ajaxWishlistItems),
+                'message' => $wishlistMessage,
+                'items' => $ajaxWishlistItems
+            ],
+            JSON_UNESCAPED_UNICODE |
+            JSON_UNESCAPED_SLASHES |
+            JSON_INVALID_UTF8_SUBSTITUTE
+        );
+        exit;
     }
 }
 
+$wishlistItems = get_customer_wishlist_items($conn, $currentCustomerId);
 $wishlistProductIds = [];
-if ($currentCustomerId > 0) {
-    $wishListStmt = $conn->prepare("SELECT product_id FROM wishlists WHERE customer_id=?");
-    if ($wishListStmt) {
-        $wishListStmt->bind_param("i", $currentCustomerId);
-        $wishListStmt->execute();
-        $wishListResult = $wishListStmt->get_result();
-        while ($wishRow = $wishListResult->fetch_assoc()) {
-            $wishlistProductIds[(int) $wishRow['product_id']] = true;
-        }
-        $wishListStmt->close();
-    }
+
+foreach ($wishlistItems as $wishlistItem) {
+    $wishlistProductIds[(int) ($wishlistItem['id'] ?? 0)] = true;
 }
 
 /* ===== Payment / return message ===== */
@@ -2386,12 +2469,27 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
         }
 
         .brandsGrid {
-            display: grid;
-            grid-template-columns: repeat(6, minmax(0, 1fr));
+            position: relative;
+            width: 100%;
+            overflow: hidden;
+        }
+
+        .brandsTrack {
+            width: 100%;
+            display: flex;
+            align-items: stretch;
             gap: 18px;
+            transform: translate3d(0, 0, 0);
+            will-change: transform;
+        }
+
+        .brandsTrack.brandSlideMoving {
+            transition: transform .78s cubic-bezier(.22, .75, .25, 1);
         }
 
         .brandCard {
+            flex: 0 0 calc((100% - 90px) / 6);
+            min-width: 0;
             min-height: 96px;
             display: flex;
             align-items: center;
@@ -2492,8 +2590,8 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
         }
 
         @media (max-width: 980px) {
-            .brandsGrid {
-                grid-template-columns: repeat(3, 1fr);
+            .brandCard {
+                flex-basis: calc((100% - 36px) / 3);
             }
         }
 
@@ -2502,12 +2600,12 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                 padding-bottom: 42px;
             }
 
-            .brandsGrid {
-                grid-template-columns: repeat(2, 1fr);
+            .brandsTrack {
                 gap: 12px;
             }
 
             .brandCard {
+                flex-basis: calc((100% - 12px) / 2);
                 min-height: 82px;
                 border-radius: 14px;
             }
@@ -4164,6 +4262,96 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
 
 
         /* ===== Wishlist + Laptop Comparison + Order Tracking ===== */
+        /* ===== Wishlist AJAX + Top Saved Button ===== */
+        .wishlistNavBtn .wishlistNavIcon {
+            color: #E11D48;
+            font-size: 20px;
+            line-height: 1;
+        }
+
+        .wishlistNavBtn:hover {
+            border-color: rgba(225, 29, 72, .35);
+            box-shadow: 0 9px 22px rgba(225, 29, 72, .12);
+        }
+
+        .wishlistCount {
+            background: #E11D48;
+            color: #fff;
+        }
+
+        .wishlistDrawerItem {
+            grid-template-columns: 82px minmax(0, 1fr) auto;
+        }
+
+        .wishlistDrawerActions {
+            display: grid;
+            gap: 7px;
+            justify-items: end;
+        }
+
+        .wishlistViewBtn,
+        .wishlistRemoveBtn {
+            min-width: 62px;
+            padding: 7px 9px;
+            border-radius: 9px;
+            font-family: var(--font-body);
+            font-size: 11px;
+            font-weight: 800;
+            text-align: center;
+            cursor: pointer;
+        }
+
+        .wishlistViewBtn {
+            border: 0;
+            background: var(--blue1);
+            color: #fff;
+        }
+
+        .wishlistRemoveBtn {
+            border: 1px solid #FECDD3;
+            background: #FFF1F2;
+            color: #BE123C;
+        }
+
+        .wishlistRemoveBtn:hover {
+            background: #FFE4E6;
+        }
+
+        .wishlistStockText {
+            display: inline-block;
+            margin-top: 6px;
+            font-size: 10.5px;
+            font-weight: 800;
+            color: #166534;
+        }
+
+        .wishlistStockText.out {
+            color: #991B1B;
+        }
+
+        body.dark-mode .wishlistRemoveBtn {
+            border-color: #5F2431 !important;
+            background: #33151D !important;
+            color: #FDA4AF !important;
+        }
+
+        @media (max-width: 520px) {
+            .wishlistDrawerItem {
+                grid-template-columns: 68px minmax(0, 1fr);
+            }
+
+            .wishlistDrawerItem .cartItemImage {
+                width: 68px;
+                height: 64px;
+            }
+
+            .wishlistDrawerActions {
+                grid-column: 1 / -1;
+                display: flex;
+                justify-content: flex-end;
+            }
+        }
+
         .productFeatureActions {
             display: grid;
             grid-template-columns: 1fr 1fr;
@@ -4598,6 +4786,13 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                 </nav>
 
                 <div class="actions">
+                    <button type="button" class="cartNavBtn wishlistNavBtn" id="wishlistNavBtn"
+                        aria-label="Open wishlist, <?= count($wishlistItems) ?> saved" aria-expanded="false"
+                        aria-controls="wishlistDrawer" title="Wishlist">
+                        <span class="cartNavIcon wishlistNavIcon" aria-hidden="true">♥</span>
+                        <span class="cartCount wishlistCount" id="wishlistCount"><?= count($wishlistItems) ?></span>
+                    </button>
+
                     <button type="button" class="cartNavBtn" id="cartNavBtn" aria-label="Open shopping cart"
                         aria-expanded="false" aria-controls="cartDrawer">
                         <span class="cartNavIcon" aria-hidden="true">🛒</span>
@@ -4640,7 +4835,7 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
             </div>
 
             <div class="filterBar" id="featured">
-                <form method="get" class="filterGrid" id="storeFilterForm">
+                <form method="get" action="index.php#laptop-results" class="filterGrid" id="storeFilterForm">
                     <input type="hidden" name="brand" id="searchBrandInput" value="<?= (int) $brand ?>">
                     <div>
                         <label>Search</label>
@@ -4662,7 +4857,7 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                             while ($c2 = $cats2->fetch_assoc()):
                                 ?>
                                 <option value="<?= (int) $c2['id'] ?>" <?= ((int) $c2['id'] === $cat) ? 'selected' : ''; ?>>
-                                        <?= e($c2['name']) ?>
+                                    <?= e($c2['name']) ?>
                                 </option>
                             <?php endwhile; ?>
                         </select>
@@ -4690,7 +4885,7 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                     <div class="filterInfo">
                         <div class="filterBadge">
                             Showing category:
-                                <?= e($selectedCategory['name']) ?>
+                            <?= e($selectedCategory['name']) ?>
                             <a class="btn outline" style="padding:6px 10px;font-size:12px"
                                 href="index.php?q=<?= urlencode($q) ?>&brand=<?= (int) $brand ?>&sort=<?= urlencode($sort) ?>#featured">
                                 All Categories
@@ -4711,14 +4906,14 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                 <?php while ($c = $cats->fetch_assoc()): ?>
                     <a class="card categoryCard <?= ((int) $c['id'] === $cat) ? 'activeCategory' : '' ?>"
                         href="index.php?cat=<?= (int) $c['id'] ?>&brand=<?= (int) $brand ?>&q=<?= urlencode($q) ?>&sort=<?= urlencode($sort) ?>#featured">
-                            <?php if (!empty($c['image_url'])): ?>
+                        <?php if (!empty($c['image_url'])): ?>
                             <img src="<?= e($c['image_url']) ?>" alt="<?= e($c['name']) ?>"
                                 style="width:100%;height:150px;object-fit:cover">
-                            <?php else: ?>
+                        <?php else: ?>
                             <div class="placeholder" style="height:150px">No Image</div>
-                            <?php endif; ?>
+                        <?php endif; ?>
                         <div class="center">
-                                <?= e($c['name']) ?>
+                            <?= e($c['name']) ?>
                         </div>
                     </a>
                 <?php endwhile; ?>
@@ -4735,27 +4930,29 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
             </div>
 
             <?php if ($brands && $brands->num_rows > 0): ?>
-                <div class="brandsGrid">
+                <div class="brandsGrid" id="brandsSliderViewport">
+                    <div class="brandsTrack" id="brandsSliderTrack">
                         <?php while ($b = $brands->fetch_assoc()): ?>
-                        <a class="brandCard <?= ((int) $b['id'] === $brand) ? 'activeBrand' : '' ?>"
-                            data-brand="<?= e(strtoupper($b['name'])) ?>"
-                            href="index.php?brand=<?= (int) $b['id'] ?>&cat=<?= (int) $cat ?>&q=<?= urlencode($q) ?>&sort=<?= urlencode($sort) ?>#featured"
-                            aria-label="Shop <?= e($b['name']) ?> laptops">
-                            <div class="brandLogoWrap">
-                                        <?php if (!empty($b['logo_url'])): ?>
-                                    <img src="<?= e($b['logo_url']) ?>" alt="<?= e($b['name']) ?> logo"
-                                        onerror="this.style.display='none';this.nextElementSibling.style.display='block';">
-                                    <span class="brandTextLogo brandTextFallback">
-                                                    <?= e($b['name']) ?>
-                                    </span>
-                                        <?php else: ?>
-                                    <span class="brandTextLogo">
-                                                    <?= e($b['name']) ?>
-                                    </span>
-                                        <?php endif; ?>
-                            </div>
-                        </a>
+                            <a class="brandCard <?= ((int) $b['id'] === $brand) ? 'activeBrand' : '' ?>"
+                                data-brand="<?= e(strtoupper($b['name'])) ?>"
+                                href="index.php?brand=<?= (int) $b['id'] ?>&cat=<?= (int) $cat ?>&q=<?= urlencode($q) ?>&sort=<?= urlencode($sort) ?>#laptop-results"
+                                aria-label="Shop <?= e($b['name']) ?> laptops">
+                                <div class="brandLogoWrap">
+                                    <?php if (!empty($b['logo_url'])): ?>
+                                        <img src="<?= e($b['logo_url']) ?>" alt="<?= e($b['name']) ?> logo"
+                                            onerror="this.style.display='none';this.nextElementSibling.style.display='block';">
+                                        <span class="brandTextLogo brandTextFallback">
+                                            <?= e($b['name']) ?>
+                                        </span>
+                                    <?php else: ?>
+                                        <span class="brandTextLogo">
+                                            <?= e($b['name']) ?>
+                                        </span>
+                                    <?php endif; ?>
+                                </div>
+                            </a>
                         <?php endwhile; ?>
+                    </div>
                 </div>
             <?php else: ?>
                 <div style="text-align:center;color:var(--ink-soft);font-weight:700">No brands available yet.</div>
@@ -4765,9 +4962,9 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                 <div class="brandFilterInfo">
                     <div class="filterBadge">
                         Showing brand:
-                            <?= e($selectedBrand['name']) ?>
+                        <?= e($selectedBrand['name']) ?>
                         <a class="btn outline" style="padding:6px 10px;font-size:12px"
-                            href="index.php?q=<?= urlencode($q) ?>&cat=<?= (int) $cat ?>&brand=0&sort=<?= urlencode($sort) ?>#featured">
+                            href="index.php?q=<?= urlencode($q) ?>&cat=<?= (int) $cat ?>&brand=0&sort=<?= urlencode($sort) ?>#laptop-results">
                             All Brands
                         </a>
                     </div>
@@ -4776,7 +4973,7 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
         </div>
     </section>
 
-    <section class="section" style="padding-top:0">
+    <section class="section" id="laptop-results" style="padding-top:0">
         <div class="container">
             <div class="title">
                 <?php
@@ -4799,90 +4996,90 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
 
             <div class="grid4">
                 <?php while ($p = $prods->fetch_assoc()): ?>
-                        <?php
-                        $gallery = split_images($p['gallery_images'] ?? '');
-                        if (count($gallery) === 0 && !empty($p['image_url'])) {
-                            $gallery[] = $p['image_url'];
-                        }
-                        ?>
+                    <?php
+                    $gallery = split_images($p['gallery_images'] ?? '');
+                    if (count($gallery) === 0 && !empty($p['image_url'])) {
+                        $gallery[] = $p['image_url'];
+                    }
+                    ?>
                     <div class="card">
-                            <?php if (count($gallery) > 0): ?>
+                        <?php if (count($gallery) > 0): ?>
                             <div class="slider productSlider" data-slider data-autoplay="true" data-interval="2500">
                                 <div class="slides">
-                                            <?php foreach ($gallery as $img): ?>
+                                    <?php foreach ($gallery as $img): ?>
                                         <div class="slide">
                                             <img src="<?= e($img) ?>" alt="<?= e($p['name']) ?>">
                                         </div>
-                                            <?php endforeach; ?>
+                                    <?php endforeach; ?>
                                 </div>
 
-                                        <?php if (count($gallery) > 1): ?>
+                                <?php if (count($gallery) > 1): ?>
                                     <button class="navBtn prev" type="button">‹</button>
                                     <button class="navBtn next" type="button">›</button>
                                     <div class="dots miniDots"></div>
-                                        <?php endif; ?>
+                                <?php endif; ?>
                             </div>
-                            <?php else: ?>
+                        <?php else: ?>
                             <div class="placeholder">No Image</div>
-                            <?php endif; ?>
+                        <?php endif; ?>
 
                         <div class="body">
                             <div style="font-weight:700;font-family:var(--font-display)">
-                                    <?= e($p['name']) ?>
+                                <?= e($p['name']) ?>
                             </div>
 
-                                <?php if (!empty($p['category_name'])): ?>
+                            <?php if (!empty($p['category_name'])): ?>
                                 <div class="smallTag">
-                                            <?= e($p['category_name']) ?>
+                                    <?= e($p['category_name']) ?>
                                 </div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
-                                <?php if (!empty($p['brand_name'])): ?>
+                            <?php if (!empty($p['brand_name'])): ?>
                                 <div class="smallTag" style="margin-left:6px">
-                                            <?= e($p['brand_name']) ?>
+                                    <?= e($p['brand_name']) ?>
                                 </div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
-                                <?php
-                                $cardRegularPrice = (float) ($p['price'] ?? 0);
-                                $cardOfferPrice = (float) ($p['offer_price'] ?? 0);
-                                $cardHasOffer = $cardOfferPrice > 0 && $cardOfferPrice < $cardRegularPrice;
-                                ?>
-                                <?php if ($cardHasOffer): ?>
+                            <?php
+                            $cardRegularPrice = (float) ($p['price'] ?? 0);
+                            $cardOfferPrice = (float) ($p['offer_price'] ?? 0);
+                            $cardHasOffer = $cardOfferPrice > 0 && $cardOfferPrice < $cardRegularPrice;
+                            ?>
+                            <?php if ($cardHasOffer): ?>
                                 <div class="priceOfferRow">
                                     <div class="price">RS.
-                                                <?= number_format($cardOfferPrice, 2) ?>
+                                        <?= number_format($cardOfferPrice, 2) ?>
                                     </div>
                                     <div class="oldPrice">RS.
-                                                <?= number_format($cardRegularPrice, 2) ?>
+                                        <?= number_format($cardRegularPrice, 2) ?>
                                     </div>
                                 </div>
-                                <?php else: ?>
+                            <?php else: ?>
                                 <div class="price">RS.
-                                            <?= number_format($cardRegularPrice, 2) ?>
+                                    <?= number_format($cardRegularPrice, 2) ?>
                                 </div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
-                                <?php $cardStock = (int) ($p['stock_quantity'] ?? 0); ?>
-                                <?php if ($cardStock <= 0): ?>
+                            <?php $cardStock = (int) ($p['stock_quantity'] ?? 0); ?>
+                            <?php if ($cardStock <= 0): ?>
                                 <div class="stockStatus out">Out of Stock</div>
-                                <?php else: ?>
+                            <?php else: ?>
                                 <div class="stockStatus in">In Stock</div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
                             <div class="ratingMini">
-                                    <?= rating_text($p['avg_rating'] ?? 0, $p['rating_count'] ?? 0) ?>
+                                <?= rating_text($p['avg_rating'] ?? 0, $p['rating_count'] ?? 0) ?>
                             </div>
 
-                                <?php $cardInWishlist = isset($wishlistProductIds[(int) $p['id']]); ?>
+                            <?php $cardInWishlist = isset($wishlistProductIds[(int) $p['id']]); ?>
                             <div class="productFeatureActions">
-                                <form method="post">
+                                <form method="post" class="wishlistForm">
                                     <input type="hidden" name="wishlist_product_id" value="<?= (int) $p['id'] ?>">
                                     <input type="hidden" name="wishlist_action"
                                         value="<?= $cardInWishlist ? 'remove' : 'add' ?>">
                                     <button type="submit"
                                         class="featureMiniBtn wishlistBtn <?= $cardInWishlist ? 'saved' : '' ?>">
-                                            <?= $cardInWishlist ? '♥ Saved' : '♡ Wishlist' ?>
+                                        <?= $cardInWishlist ? '♥ Saved' : '♡ Wishlist' ?>
                                     </button>
                                 </form>
 
@@ -4923,98 +5120,98 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
         <section class="detailsWrap" id="details">
             <div class="container">
                 <div class="title">
-                        <?= e($selected['name']) ?> Details<div class="divider"></div>
+                    <?= e($selected['name']) ?> Details<div class="divider"></div>
                 </div>
 
                 <div class="detailsCard">
                     <div class="detailsGrid">
                         <div class="slider detailSlider" data-slider data-autoplay="true" data-interval="3000">
                             <div class="slides">
-                                    <?php if (count($selectedImages) > 0): ?>
-                                            <?php foreach ($selectedImages as $imgPath): ?>
+                                <?php if (count($selectedImages) > 0): ?>
+                                    <?php foreach ($selectedImages as $imgPath): ?>
                                         <div class="slide"><img src="<?= e($imgPath) ?>" alt=""></div>
-                                            <?php endforeach; ?>
-                                    <?php else: ?>
+                                    <?php endforeach; ?>
+                                <?php else: ?>
                                     <div class="slide">
                                         <div class="placeholder" style="height:380px">No Image</div>
                                     </div>
-                                    <?php endif; ?>
+                                <?php endif; ?>
                             </div>
 
-                                <?php if (count($selectedImages) > 1): ?>
+                            <?php if (count($selectedImages) > 1): ?>
                                 <button class="navBtn prev" type="button">‹</button>
                                 <button class="navBtn next" type="button">›</button>
                                 <div class="dots"></div>
-                                <?php endif; ?>
+                            <?php endif; ?>
                         </div>
 
                         <div class="detailsBody">
                             <h2 style="margin:0 0 6px;font-weight:700;letter-spacing:-.3px">
-                                    <?= e($selected['name']) ?>
+                                <?= e($selected['name']) ?>
                             </h2>
 
-                                <?php if (!empty($selected['category_name'])): ?>
+                            <?php if (!empty($selected['category_name'])): ?>
                                 <div class="smallTag" style="margin-bottom:8px">
-                                            <?= e($selected['category_name']) ?>
+                                    <?= e($selected['category_name']) ?>
                                 </div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
-                                <?php if (!empty($selected['brand_name'])): ?>
+                            <?php if (!empty($selected['brand_name'])): ?>
                                 <div class="smallTag" style="margin-bottom:8px;margin-left:6px">
-                                            <?= e($selected['brand_name']) ?>
+                                    <?= e($selected['brand_name']) ?>
                                 </div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
-                                <?php
-                                $selectedRegularPrice = (float) ($selected['price'] ?? 0);
-                                $selectedOfferPrice = (float) ($selected['offer_price'] ?? 0);
-                                $selectedHasOffer = $selectedOfferPrice > 0 && $selectedOfferPrice < $selectedRegularPrice;
-                                ?>
-                                <?php if ($selectedHasOffer): ?>
+                            <?php
+                            $selectedRegularPrice = (float) ($selected['price'] ?? 0);
+                            $selectedOfferPrice = (float) ($selected['offer_price'] ?? 0);
+                            $selectedHasOffer = $selectedOfferPrice > 0 && $selectedOfferPrice < $selectedRegularPrice;
+                            ?>
+                            <?php if ($selectedHasOffer): ?>
                                 <div class="priceOfferRow">
                                     <div class="price">RS.
-                                                <?= number_format($selectedOfferPrice, 2) ?>
+                                        <?= number_format($selectedOfferPrice, 2) ?>
                                     </div>
                                     <div class="oldPrice">RS.
-                                                <?= number_format($selectedRegularPrice, 2) ?>
+                                        <?= number_format($selectedRegularPrice, 2) ?>
                                     </div>
                                 </div>
-                                <?php else: ?>
+                            <?php else: ?>
                                 <div class="price">RS.
-                                            <?= number_format($selectedRegularPrice, 2) ?>
+                                    <?= number_format($selectedRegularPrice, 2) ?>
                                 </div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
-                                <?php $selectedStock = (int) ($selected['stock_quantity'] ?? 0); ?>
-                                <?php if ($selectedStock <= 0): ?>
+                            <?php $selectedStock = (int) ($selected['stock_quantity'] ?? 0); ?>
+                            <?php if ($selectedStock <= 0): ?>
                                 <div class="stockStatus out">Out of Stock</div>
-                                <?php else: ?>
+                            <?php else: ?>
                                 <div class="stockStatus in">In Stock</div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
-                                <?php $selectedColors = parse_product_colors($selected['available_colors'] ?? ''); ?>
-                                <?php if (count($selectedColors) > 0): ?>
+                            <?php $selectedColors = parse_product_colors($selected['available_colors'] ?? ''); ?>
+                            <?php if (count($selectedColors) > 0): ?>
                                 <div class="productColorsBlock">
                                     <div class="productColorsLabel">Available Colors</div>
                                     <div class="productColorList" aria-label="Available laptop colors">
-                                                <?php foreach ($selectedColors as $productColor): ?>
+                                        <?php foreach ($selectedColors as $productColor): ?>
                                             <span class="productColorSwatch" style="background:<?= e($productColor['css']) ?>"
                                                 title="<?= e($productColor['name']) ?>"
                                                 aria-label="<?= e($productColor['name']) ?>"></span>
-                                                <?php endforeach; ?>
+                                        <?php endforeach; ?>
                                     </div>
                                 </div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
-                                <?php $selectedInWishlist = isset($wishlistProductIds[(int) $selected['id']]); ?>
+                            <?php $selectedInWishlist = isset($wishlistProductIds[(int) $selected['id']]); ?>
                             <div class="productFeatureActions" style="max-width:420px">
-                                <form method="post">
+                                <form method="post" class="wishlistForm">
                                     <input type="hidden" name="wishlist_product_id" value="<?= (int) $selected['id'] ?>">
                                     <input type="hidden" name="wishlist_action"
                                         value="<?= $selectedInWishlist ? 'remove' : 'add' ?>">
                                     <button type="submit"
                                         class="featureMiniBtn wishlistBtn <?= $selectedInWishlist ? 'saved' : '' ?>">
-                                            <?= $selectedInWishlist ? '♥ Saved' : '♡ Wishlist' ?>
+                                        <?= $selectedInWishlist ? '♥ Saved' : '♡ Wishlist' ?>
                                     </button>
                                 </form>
 
@@ -5036,46 +5233,46 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                             </div>
 
                             <div class="muted">
-                                    <?= e($selected['description'] ?? 'No description yet. Admin dashboard la update pannalaam.') ?>
+                                <?= e($selected['description'] ?? 'No description yet. Admin dashboard la update pannalaam.') ?>
                             </div>
 
-                                <?php if ($payment_msg !== ""): ?>
+                            <?php if ($payment_msg !== ""): ?>
                                 <div class="<?= $payment_type === 'error' ? 'error' : 'info' ?>">
-                                            <?= e($payment_msg) ?>
+                                    <?= e($payment_msg) ?>
                                 </div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
-                                <?php if ($order_msg && $order_for_id === (int) $selected['id']): ?>
+                            <?php if ($order_msg && $order_for_id === (int) $selected['id']): ?>
                                 <div class="success">
-                                            <?= e($order_msg) ?>
+                                    <?= e($order_msg) ?>
                                 </div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
-                                <?php if ($order_err && $order_for_id === (int) $selected['id']): ?>
+                            <?php if ($order_err && $order_for_id === (int) $selected['id']): ?>
                                 <div class="error">
-                                            <?= e($order_err) ?>
+                                    <?= e($order_err) ?>
                                 </div>
-                                <?php endif; ?>
+                            <?php endif; ?>
 
 
                             <div class="ratingBox">
                                 <div class="ratingTitle">Product Rating</div>
 
                                 <div style="font-weight:700;color:var(--amber-deep);margin-bottom:8px">
-                                        <?= rating_text($selectedAvgRating, $selectedRatingCount) ?>
+                                    <?= rating_text($selectedAvgRating, $selectedRatingCount) ?>
                                 </div>
 
-                                    <?php if ($rating_msg && $rating_for_id === (int) $selected['id']): ?>
+                                <?php if ($rating_msg && $rating_for_id === (int) $selected['id']): ?>
                                     <div class="success">
-                                                <?= e($rating_msg) ?>
+                                        <?= e($rating_msg) ?>
                                     </div>
-                                    <?php endif; ?>
+                                <?php endif; ?>
 
-                                    <?php if ($rating_err && $rating_for_id === (int) $selected['id']): ?>
+                                <?php if ($rating_err && $rating_for_id === (int) $selected['id']): ?>
                                     <div class="error">
-                                                <?= e($rating_err) ?>
+                                        <?= e($rating_err) ?>
                                     </div>
-                                    <?php endif; ?>
+                                <?php endif; ?>
 
                                 <form method="post"
                                     action="index.php?product_id=<?= (int) $selected['id'] ?>&q=<?= urlencode($q) ?>&cat=<?= (int) $cat ?>&brand=<?= (int) $brand ?>&sort=<?= urlencode($sort) ?>#details">
@@ -5110,33 +5307,33 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                                     </button>
                                 </form>
 
-                                    <?php if ($selectedReviews && $selectedReviews->num_rows > 0): ?>
+                                <?php if ($selectedReviews && $selectedReviews->num_rows > 0): ?>
                                     <div style="margin-top:14px;font-weight:700;font-family:var(--font-display)">Customer
                                         Reviews</div>
 
-                                            <?php while ($rev = $selectedReviews->fetch_assoc()): ?>
+                                    <?php while ($rev = $selectedReviews->fetch_assoc()): ?>
                                         <div class="reviewItem">
                                             <div class="reviewHead">
                                                 <span>
-                                                                <?= e($rev['customer_name'] ?? 'Customer') ?>
+                                                    <?= e($rev['customer_name'] ?? 'Customer') ?>
                                                 </span>
                                                 <span style="color:var(--amber-deep)">
-                                                                <?= e(rating_stars((int) $rev['rating'])) ?>
+                                                    <?= e(rating_stars((int) $rev['rating'])) ?>
                                                 </span>
                                             </div>
 
-                                                        <?php if (!empty($rev['review'])): ?>
+                                            <?php if (!empty($rev['review'])): ?>
                                                 <div class="reviewText">
-                                                                    <?= e($rev['review']) ?>
+                                                    <?= e($rev['review']) ?>
                                                 </div>
-                                                        <?php endif; ?>
+                                            <?php endif; ?>
                                         </div>
-                                            <?php endwhile; ?>
-                                    <?php else: ?>
+                                    <?php endwhile; ?>
+                                <?php else: ?>
                                     <div style="margin-top:10px;color:var(--ink-soft);font-weight:700">
                                         No reviews yet. Be the first to rate this laptop.
                                     </div>
-                                    <?php endif; ?>
+                                <?php endif; ?>
                             </div>
 
                             <h3 style="margin:16px 0 6px;font-weight:700">Order Now</h3>
@@ -5182,7 +5379,7 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                                         data-cart-image="<?= e($selectedImages[0] ?? ($selected['image_url'] ?? '')) ?>"
                                         data-cart-stock="<?= $selectedStock ?>" onclick="addToCartFromButton(this)"
                                         <?= $selectedStock <= 0 ? 'disabled' : '' ?>>
-                                            <?= $selectedStock <= 0 ? 'Out of Stock' : '🛒 Add to Cart' ?>
+                                        <?= $selectedStock <= 0 ? 'Out of Stock' : '🛒 Add to Cart' ?>
                                     </button>
                                     <button class="btn cod" type="submit" name="place_order" <?= $selectedStock <= 0 ? 'disabled' : '' ?>>Cash on Delivery</button>
                                     <button class="btn pay" type="submit" name="pay_online" <?= $selectedStock <= 0 ? 'disabled' : '' ?>>Pay Online</button>
@@ -5283,7 +5480,7 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                         </a>
                         <?php if (!empty($settings['phone'])): ?>
                             <span class="servicesPhone">☎
-                                    <?= e($settings['phone']) ?>
+                                <?= e($settings['phone']) ?>
                             </span>
                         <?php endif; ?>
                     </div>
@@ -5385,6 +5582,27 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
         </div>
         <div class="compareTableWrap" id="compareTableWrap"></div>
     </div>
+
+    <!-- Wishlist Drawer -->
+    <div class="cartBackdrop" id="wishlistBackdrop" aria-hidden="true"></div>
+    <aside class="cartDrawer" id="wishlistDrawer" aria-label="Saved laptops" aria-hidden="true">
+        <div class="cartDrawerHead">
+            <div>
+                <span class="cartDrawerEyebrow">Saved laptops</span>
+                <h3>My Wishlist</h3>
+            </div>
+            <button type="button" class="cartCloseBtn" id="wishlistCloseBtn" aria-label="Close wishlist">✕</button>
+        </div>
+
+        <div class="cartItems" id="wishlistItems"></div>
+
+        <div class="cartEmpty" id="wishlistEmpty">
+            <div class="cartEmptyIcon">♥</div>
+            <strong>Your wishlist is empty</strong>
+            <span>Tap Wishlist on a laptop and it will appear here instantly.</span>
+        </div>
+    </aside>
+
 
     <!-- Shopping Cart Drawer -->
     <div class="cartBackdrop" id="cartBackdrop" aria-hidden="true"></div>
@@ -5492,7 +5710,7 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                         <?php if (!empty($settings['address'])): ?>
                             <div class="footerContactItem">
                                 <strong>Address:</strong>
-                                    <?= e($settings['address']) ?>
+                                <?= e($settings['address']) ?>
                             </div>
                         <?php endif; ?>
 
@@ -5500,7 +5718,7 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                             <div class="footerContactItem">
                                 <strong>Phone:</strong>
                                 <a href="<?= e($whatsAppBase) ?>" target="_blank" rel="noopener noreferrer">
-                                        <?= e($settings['phone']) ?>
+                                    <?= e($settings['phone']) ?>
                                 </a>
                             </div>
                         <?php endif; ?>
@@ -5509,7 +5727,7 @@ if (isset($_POST['place_order']) || isset($_POST['pay_online'])) {
                             <div class="footerContactItem">
                                 <strong>Email:</strong>
                                 <a href="mailto:<?= e($settings['email']) ?>">
-                                        <?= e($settings['email']) ?>
+                                    <?= e($settings['email']) ?>
                                 </a>
                             </div>
                         <?php endif; ?>
@@ -6386,6 +6604,261 @@ Address: ${addr}`;
 
 
     <script>
+        /* ===== Wishlist: AJAX save/remove + top saved-items drawer ===== */
+        (function () {
+            const wishlistNavBtn = document.getElementById('wishlistNavBtn');
+            const wishlistCount = document.getElementById('wishlistCount');
+            const wishlistDrawer = document.getElementById('wishlistDrawer');
+            const wishlistBackdrop = document.getElementById('wishlistBackdrop');
+            const wishlistCloseBtn = document.getElementById('wishlistCloseBtn');
+            const wishlistItemsEl = document.getElementById('wishlistItems');
+            const wishlistEmpty = document.getElementById('wishlistEmpty');
+
+            let wishlistItemsState = <?= json_encode(
+                $wishlistItems,
+                JSON_UNESCAPED_UNICODE |
+                JSON_UNESCAPED_SLASHES |
+                JSON_HEX_TAG |
+                JSON_HEX_AMP |
+                JSON_HEX_APOS |
+                JSON_HEX_QUOT |
+                JSON_INVALID_UTF8_SUBSTITUTE
+            ) ?>;
+
+            function escapeHtml(value) {
+                return String(value ?? '')
+                    .replace(/&/g, '&amp;')
+                    .replace(/</g, '&lt;')
+                    .replace(/>/g, '&gt;')
+                    .replace(/"/g, '&quot;')
+                    .replace(/'/g, '&#039;');
+            }
+
+            function formatWishlistMoney(value) {
+                return 'Rs. ' + Number(value || 0).toLocaleString('en-LK', {
+                    minimumFractionDigits: 2,
+                    maximumFractionDigits: 2
+                });
+            }
+
+            function effectiveWishlistPrice(item) {
+                const regular = Number(item?.price || 0);
+                const offer = Number(item?.offer_price || 0);
+                return offer > 0 && offer < regular ? offer : regular;
+            }
+
+            function savedIdSet() {
+                return new Set(
+                    wishlistItemsState.map(item => String(item?.id || ''))
+                );
+            }
+
+            function syncWishlistButtons() {
+                const savedIds = savedIdSet();
+
+                document.querySelectorAll('.wishlistForm').forEach(form => {
+                    const idInput = form.querySelector('[name="wishlist_product_id"]');
+                    const actionInput = form.querySelector('[name="wishlist_action"]');
+                    const button = form.querySelector('.wishlistBtn');
+
+                    if (!idInput || !actionInput || !button) return;
+
+                    const isSaved = savedIds.has(String(idInput.value || ''));
+                    actionInput.value = isSaved ? 'remove' : 'add';
+                    button.classList.toggle('saved', isSaved);
+                    button.textContent = isSaved ? '♥ Saved' : '♡ Wishlist';
+                    button.setAttribute(
+                        'aria-label',
+                        isSaved ? 'Remove from wishlist' : 'Save to wishlist'
+                    );
+                });
+            }
+
+            function renderWishlist() {
+                const count = wishlistItemsState.length;
+
+                if (wishlistCount) {
+                    wishlistCount.textContent = String(count);
+                }
+
+                if (wishlistNavBtn) {
+                    wishlistNavBtn.setAttribute(
+                        'aria-label',
+                        'Open wishlist, ' + count + ' saved'
+                    );
+                    wishlistNavBtn.title = 'Wishlist (' + count + ')';
+                }
+
+                if (!wishlistItemsEl || !wishlistEmpty) {
+                    syncWishlistButtons();
+                    return;
+                }
+
+                wishlistItemsEl.innerHTML = '';
+
+                if (count === 0) {
+                    wishlistItemsEl.style.display = 'none';
+                    wishlistEmpty.classList.add('show');
+                    syncWishlistButtons();
+                    return;
+                }
+
+                wishlistItemsEl.style.display = '';
+                wishlistEmpty.classList.remove('show');
+
+                wishlistItemsState.forEach(item => {
+                    const id = Number(item?.id || 0);
+                    const name = String(item?.name || 'Laptop');
+                    const image = String(item?.image_url || '');
+                    const stock = Number(item?.stock_quantity || 0);
+                    const price = effectiveWishlistPrice(item);
+
+                    const row = document.createElement('div');
+                    row.className = 'cartItem wishlistDrawerItem';
+                    row.dataset.wishlistItemId = String(id);
+
+                    const imageHtml = image
+                        ? '<img src="' + escapeHtml(image) + '" alt="' + escapeHtml(name) + '">'
+                        : '<div class="cartItemImageFallback">💻</div>';
+
+                    row.innerHTML =
+                        '<div class="cartItemImage">' +
+                        imageHtml +
+                        '</div>' +
+                        '<div>' +
+                        '<div class="cartItemName">' + escapeHtml(name) + '</div>' +
+                        '<div class="cartItemPrice">' + escapeHtml(formatWishlistMoney(price)) + '</div>' +
+                        '<span class="wishlistStockText ' + (stock > 0 ? '' : 'out') + '">' +
+                        (stock > 0 ? 'In Stock' : 'Out of Stock') +
+                        '</span>' +
+                        '</div>' +
+                        '<div class="wishlistDrawerActions">' +
+                        '<a class="wishlistViewBtn" href="index.php?product_id=' + encodeURIComponent(id) + '#details">View</a>' +
+                        '<button type="button" class="wishlistRemoveBtn" data-wishlist-remove-id="' + escapeHtml(id) + '">Remove</button>' +
+                        '</div>';
+
+                    wishlistItemsEl.appendChild(row);
+                });
+
+                syncWishlistButtons();
+            }
+
+            function openWishlist() {
+                if (typeof closeCart === 'function') {
+                    closeCart();
+                }
+
+                wishlistDrawer?.classList.add('open');
+                wishlistBackdrop?.classList.add('open');
+                wishlistDrawer?.setAttribute('aria-hidden', 'false');
+                wishlistBackdrop?.setAttribute('aria-hidden', 'false');
+                wishlistNavBtn?.setAttribute('aria-expanded', 'true');
+                document.body.classList.add('cart-open');
+            }
+
+            function closeWishlist() {
+                wishlistDrawer?.classList.remove('open');
+                wishlistBackdrop?.classList.remove('open');
+                wishlistDrawer?.setAttribute('aria-hidden', 'true');
+                wishlistBackdrop?.setAttribute('aria-hidden', 'true');
+                wishlistNavBtn?.setAttribute('aria-expanded', 'false');
+                document.body.classList.remove('cart-open');
+            }
+
+            async function updateWishlist(productId, action, sourceButton = null) {
+                const id = Number(productId || 0);
+                if (!id || !['add', 'remove'].includes(action)) return;
+
+                if (sourceButton) {
+                    sourceButton.disabled = true;
+                }
+
+                const formData = new FormData();
+                formData.set('wishlist_product_id', String(id));
+                formData.set('wishlist_action', action);
+                formData.set('wishlist_ajax', '1');
+
+                try {
+                    const response = await fetch('index.php', {
+                        method: 'POST',
+                        credentials: 'same-origin',
+                        cache: 'no-store',
+                        headers: {
+                            'Accept': 'application/json',
+                            'X-Requested-With': 'XMLHttpRequest'
+                        },
+                        body: formData
+                    });
+
+                    const raw = await response.text();
+                    let data = null;
+
+                    try {
+                        data = raw ? JSON.parse(raw) : null;
+                    } catch (error) {
+                        throw new Error('Wishlist server returned an invalid response.');
+                    }
+
+                    if (!response.ok || !data?.success) {
+                        throw new Error(data?.message || 'Wishlist update failed.');
+                    }
+
+                    wishlistItemsState = Array.isArray(data.items) ? data.items : [];
+                    renderWishlist();
+                } catch (error) {
+                    alert(String(error?.message || 'Wishlist update failed. Please try again.'));
+                } finally {
+                    if (sourceButton) {
+                        sourceButton.disabled = false;
+                    }
+                }
+            }
+
+            document.querySelectorAll('.wishlistForm').forEach(form => {
+                form.addEventListener('submit', function (event) {
+                    event.preventDefault();
+
+                    const idInput = form.querySelector('[name="wishlist_product_id"]');
+                    const actionInput = form.querySelector('[name="wishlist_action"]');
+                    const button = form.querySelector('.wishlistBtn');
+
+                    updateWishlist(
+                        Number(idInput?.value || 0),
+                        String(actionInput?.value || ''),
+                        button
+                    );
+                });
+            });
+
+            wishlistItemsEl?.addEventListener('click', function (event) {
+                const removeBtn = event.target.closest('[data-wishlist-remove-id]');
+                if (!removeBtn) return;
+
+                updateWishlist(
+                    Number(removeBtn.getAttribute('data-wishlist-remove-id') || 0),
+                    'remove',
+                    removeBtn
+                );
+            });
+
+            wishlistNavBtn?.addEventListener('click', openWishlist);
+            wishlistCloseBtn?.addEventListener('click', closeWishlist);
+            wishlistBackdrop?.addEventListener('click', closeWishlist);
+
+            document.getElementById('cartNavBtn')?.addEventListener('click', closeWishlist);
+
+            document.addEventListener('keydown', function (event) {
+                if (event.key === 'Escape' && wishlistDrawer?.classList.contains('open')) {
+                    closeWishlist();
+                }
+            });
+
+            renderWishlist();
+        })();
+    </script>
+
+
+    <script>
         /* ===== Laptop Comparison: select 2-3 and auto-generate ===== */
         (function () {
             const selected = new Map();
@@ -6535,6 +7008,136 @@ Address: ${addr}`;
             });
 
             renderBar();
+        })();
+    </script>
+
+    <script>
+        /* ===== Shop by Brand: continuous auto-scroll + pause on hover ===== */
+        (function () {
+            const viewport = document.getElementById('brandsSliderViewport');
+            const track = document.getElementById('brandsSliderTrack');
+
+            if (!viewport || !track) return;
+
+            const originalCards = Array.from(track.querySelectorAll('.brandCard'));
+            const originalCount = originalCards.length;
+
+            if (originalCount < 2) return;
+
+            /*
+             * One visual copy is enough for a seamless loop.
+             * Existing PHP/database brand links and filter behavior stay unchanged.
+             */
+            originalCards.forEach(function (card) {
+                const clone = card.cloneNode(true);
+                clone.setAttribute('data-brand-slider-clone', '1');
+                clone.setAttribute('aria-hidden', 'true');
+
+                clone.querySelectorAll('a, button, input, select, textarea').forEach(function (el) {
+                    el.setAttribute('tabindex', '-1');
+                });
+
+                track.appendChild(clone);
+            });
+
+            let offset = 0;
+            let lastTime = 0;
+            let pausedByHover = false;
+            let pausedByFocus = false;
+            let originalRowWidth = 0;
+
+            /* Change this only if you want the continuous movement faster/slower. */
+            const SPEED = 42; // pixels per second
+
+            function measureOriginalRow() {
+                const firstCard = originalCards[0];
+                if (!firstCard) {
+                    originalRowWidth = 0;
+                    return;
+                }
+
+                const trackStyle = window.getComputedStyle(track);
+                const gap = parseFloat(trackStyle.columnGap || trackStyle.gap || '0') || 0;
+                const cardWidth = firstCard.getBoundingClientRect().width;
+
+                originalRowWidth = (cardWidth * originalCount) + (gap * originalCount);
+            }
+
+            function isPaused() {
+                return pausedByHover || pausedByFocus || document.hidden;
+            }
+
+            function render() {
+                track.classList.remove('brandSlideMoving');
+                track.style.transform = 'translate3d(' + (-offset) + 'px, 0, 0)';
+            }
+
+            function animate(now) {
+                if (!lastTime) {
+                    lastTime = now;
+                }
+
+                const deltaSeconds = Math.min((now - lastTime) / 1000, 0.05);
+                lastTime = now;
+
+                if (!isPaused() && originalRowWidth > 0) {
+                    offset += SPEED * deltaSeconds;
+
+                    if (offset >= originalRowWidth) {
+                        offset = offset % originalRowWidth;
+                    }
+
+                    render();
+                }
+
+                window.requestAnimationFrame(animate);
+            }
+
+            /* Laptop/desktop: cursor enters brand row -> stop immediately. */
+            viewport.addEventListener('mouseenter', function () {
+                pausedByHover = true;
+            });
+
+            /* Cursor leaves brand row -> continue from the same place. */
+            viewport.addEventListener('mouseleave', function () {
+                pausedByHover = false;
+                lastTime = performance.now();
+            });
+
+            /* Keep keyboard users able to select a brand without it moving away. */
+            viewport.addEventListener('focusin', function () {
+                pausedByFocus = true;
+            });
+
+            viewport.addEventListener('focusout', function () {
+                window.setTimeout(function () {
+                    if (!viewport.contains(document.activeElement)) {
+                        pausedByFocus = false;
+                        lastTime = performance.now();
+                    }
+                }, 0);
+            });
+
+            document.addEventListener('visibilitychange', function () {
+                lastTime = performance.now();
+            });
+
+            window.addEventListener('resize', function () {
+                measureOriginalRow();
+
+                if (originalRowWidth > 0) {
+                    offset = offset % originalRowWidth;
+                } else {
+                    offset = 0;
+                }
+
+                render();
+                lastTime = performance.now();
+            });
+
+            measureOriginalRow();
+            render();
+            window.requestAnimationFrame(animate);
         })();
     </script>
 
